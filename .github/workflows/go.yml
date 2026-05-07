@@ -2,12 +2,15 @@ name: Build Traefik Plugin
 
 on:
   push:
+    branches: [main]
     tags:
       - v*
+  pull_request:
+    branches: [main]
 
 jobs:
   build:
-    name: Build Plugin
+    name: Lint and Test
     runs-on: ubuntu-latest
     env:
         GO_VERSION: '1.22.0' # Latest stable Go version
@@ -45,26 +48,13 @@ jobs:
         run: |
             go mod tidy
             go mod download
-      
+
       # Run linting
       - name: Lint code
         run: |
           $(go env GOPATH)/bin/golangci-lint run --timeout=5m
-      
+
       # Run tests
       - name: Run tests
         run: |
           go test ./...
-
-      # Build the plugin
-      # - name: Build plugin
-      #   run: |
-      #     go build -v -buildmode=plugin -o traefik-plugin-block-useragents.so block_useragents.go
-
-      # Upload the .so file as an artifact
-      # - name: Upload artifact
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: block_UserAgents.so
-      #     path: block_UserAgents.so
-      #     retention-days: 7

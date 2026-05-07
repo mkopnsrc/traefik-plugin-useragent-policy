@@ -1,6 +1,7 @@
 # .golangci.toml
 [run]
 timeout = "5m"
+exclude-dirs = [".github"]
 
 [linters]
 enable = [
@@ -27,9 +28,9 @@ checks = ["all"]
 locale = "US"
 
 [issues]
-[[issues.exclude-rules]]
-path = "block_useragents.go"
-linters = ["revive"]
 max-issues-per-linter = 50
 max-same-issues = 10
-exclude-dirs = [".github"]  # Replaced skip-dirs
+
+[[issues.exclude-rules]]
+path = "block_useragents.*\\.go"
+linters = ["revive"]
