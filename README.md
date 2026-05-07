@@ -22,7 +22,7 @@ Two optional knobs harden behavior in non-trivial deployments:
 
 | Option | Default | Recommended in production | Purpose |
 | --- | --- | --- | --- |
-| `strictMatch` | `false` | `true` | Prepend `\b` to each browser/OS regex so patterns must begin at a word boundary. Prevents accidental partial-word matches such as `Chrome/130` matching inside `MyChrome/130`. Existing patterns generally keep working. |
+| `strictMatch` | `false` | `true` | Prepend `\b` to each browser/OS regex so patterns must begin at a word boundary. Prevents the rule from matching when the token sits inside a longer word (e.g., `Chrome/130` no longer matches inside `MyChrome/130`). Patterns preceded by non-word characters such as `-`, `/`, or `.` (e.g., `X-Chrome/130`) still match because `\b` only requires a word/non-word transition. Existing patterns generally keep working. |
 | `clientIPHeader` | `""` | `"X-Forwarded-For"` (only when behind a trusted proxy) | When set, the first comma-separated value of the named header is logged as the client IP instead of `req.RemoteAddr` (which is the proxy peer behind Traefik). The header value is trusted verbatim — only enable when Traefik's `forwardedHeaders.trustedIPs` is configured to validate or strip the header. |
 
 Blocked-request log lines record the request **path** without the query string, so signed-URL tokens and session parameters carried in `?token=...` are not surfaced into logs.
