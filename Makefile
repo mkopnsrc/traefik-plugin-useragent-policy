@@ -1,33 +1,32 @@
 # Makefile
-.PHONY: all build lint clean
+.PHONY: all ci lint deps vulncheck build test clean
 
 # Default target
-all: lint build
+all: lint test build
 
-.PHONY: ci
-ci: inst tidy all vulncheck
+# Full CI pipeline run locally
+ci: deps lint test vulncheck
 
-.PHONY: lint
 # Run linters
 lint:
-    golangci-lint run
+	golangci-lint run
 
-# Install dependencies (if needed in the future)
+# Tidy module dependencies
 deps:
-    go mod tidy
+	go mod tidy
 
 # Run vulnerability check
 vulncheck:
-		gosec ./...
+	gosec ./...
 
-# Build the plugin
+# Build the plugin (compile-only check; Traefik loads the plugin via Yaegi, not the .so)
 build:
-    go build -buildmode=plugin -o traefik-plugin-block-useragents.so block_useragents.go
+	go build -buildmode=plugin -o traefik-plugin-block-useragents.so block_useragents.go
 
 # Run tests
 test:
-		go test -v ./...
+	go test -v ./...
 
 # Clean up generated files
 clean:
-    rm -f traefik-plugin-block-useragents.so
+	rm -f traefik-plugin-block-useragents.so
