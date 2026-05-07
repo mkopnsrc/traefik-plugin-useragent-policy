@@ -230,6 +230,7 @@ func TestClientIP(t *testing.T) {
 		{name: "single value in header is used", headerName: "X-Forwarded-For", headerVal: "203.0.113.1", remoteAddr: "10.0.0.1:1234", want: "203.0.113.1"},
 		{name: "comma-separated picks leftmost trimmed", headerName: "X-Forwarded-For", headerVal: "203.0.113.1, 198.51.100.7, 10.0.0.5", remoteAddr: "10.0.0.1:1234", want: "203.0.113.1"},
 		{name: "leading whitespace in single value is trimmed", headerName: "X-Forwarded-For", headerVal: "  203.0.113.1  ", remoteAddr: "10.0.0.1:1234", want: "203.0.113.1"},
+		{name: "leading whitespace before comma is trimmed", headerName: "X-Forwarded-For", headerVal: "  203.0.113.1  , 10.0.0.5", remoteAddr: "10.0.0.1:1234", want: "203.0.113.1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
