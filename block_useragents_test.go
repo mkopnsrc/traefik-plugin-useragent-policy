@@ -442,6 +442,20 @@ func TestNew_RejectsNegativeLogSampleN(t *testing.T) {
 	}
 }
 
+// TestNew_RejectsEmptyBypassPath catches the misconfiguration that would
+// otherwise silently disable all UA checks: strings.HasPrefix(anyPath, "")
+// returns true, so an empty entry in BypassPaths matches every request.
+// A YAML typo like `bypassPaths: ["", "/healthz"]` must fail loudly at
+// startup rather than letting traffic through.
+func TestNew_RejectsEmptyBypassPath(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/130"}}
+	cfg.BypassPaths = []string{"/healthz", ""}
+	if _, err := New(context.Background(), nopHandler(), cfg, "test"); err == nil {
+		t.Fatal("expected error for empty bypassPaths entry, got nil")
+	}
+}
+
 // TestServeHTTP_CountersIncrement drives traffic through every code path
 // and verifies the atomic counters end up with the right totals.
 func TestServeHTTP_CountersIncrement(t *testing.T) {
@@ -653,7 +667,7 @@ func TestLogMetricsSnapshot(t *testing.T) {
 }
 
 // TestMetricsLogLoop_RespectsContextCancellation is the load-bearing test
-// for the goroutine lifecycle: when the context passed to New is cancelled
+// for the goroutine lifecycle: when the context passed to New is canceled
 // (Traefik plugin teardown), the metrics goroutine must exit. Otherwise
 // every config reload leaks one goroutine.
 func TestMetricsLogLoop_RespectsContextCancellation(t *testing.T) {
