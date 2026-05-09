@@ -305,3 +305,159 @@ func TestServeHTTP_ClientIPHeaderInLog(t *testing.T) {
 		t.Errorf("log should NOT include proxy RemoteAddr when header is configured, got: %s", out)
 	}
 }
+
+// Validation tests for the new fields.
+
+func TestNew_RejectsInvalidMode(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/130"}}
+	cfg.Mode = "monitor"
+	if _, err := New(context.Background(), nopHandler(), cfg, "test"); err == nil {
+		t.Fatal("expected error for invalid mode, got nil")
+	}
+}
+
+func TestNew_RejectsInvalidAction(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/130", Action: "challenge"}}
+	if _, err := New(context.Background(), nopHandler(), cfg, "test"); err == nil {
+		t.Fatal("expected error for invalid action, got nil")
+	}
+}
+
+func TestNew_RejectsDenyOnlyConfig(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "BadBot", Regex: "EvilBot", Action: ActionDeny}}
+	if _, err := New(context.Background(), nopHandler(), cfg, "test"); err == nil {
+		t.Fatal("expected error for deny-only config, got nil")
+	}
+}
+
+func TestNew_AcceptsExplicitAllowAction(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/130", Action: ActionAllow}}
+	if _, err := New(context.Background(), nopHandler(), cfg, "test"); err != nil {
+		t.Fatalf("expected no error for action=allow, got %v", err)
+	}
+}
+
+// TestServeHTTP_DenyPrecedence verifies that deny rules block UAs that would
+// otherwise match an allow rule.
+func TestServeHTTP_DenyPrecedence(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{
+		{Name: "Chrome", Regex: "Chrome/13[0-3]", Action: ActionAllow},
+		{Name: "ChromeHeadless", Regex: "HeadlessChrome", Action: ActionDeny},
+	}
+
+	nextCalled := false
+	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { nextCalled = true })
+	handler, err := New(context.Background(), next, cfg, "test")
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 HeadlessChrome/130.0.0.0 Safari/537.36 Chrome/130.0")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status: got %d, want 403", rec.Code)
+	}
+	if nextCalled {
+		t.Error("next must not be called when a deny rule matches")
+	}
+}
+
+// TestServeHTTP_BypassPaths verifies that bypass-prefix paths skip all checks.
+func TestServeHTTP_BypassPaths(t *testing.T) {
+	tests := []struct {
+		name           string
+		path           string
+		userAgent      string
+		setUserAgent   bool
+		wantNextCalled bool
+		wantStatus     int
+	}{
+		{name: "exact bypass match skips checks even without UA", path: "/healthz", setUserAgent: false, wantNextCalled: true, wantStatus: http.StatusOK},
+		{name: "prefix bypass match skips checks even with bad UA", path: "/.well-known/acme-challenge/token", userAgent: "WrongBrowser/1.0", setUserAgent: true, wantNextCalled: true, wantStatus: http.StatusOK},
+		{name: "non-bypass path with bad UA still blocked", path: "/api/data", userAgent: "WrongBrowser/1.0", setUserAgent: true, wantNextCalled: false, wantStatus: http.StatusForbidden},
+		{name: "non-bypass path with good UA passes through normal flow", path: "/api/data", userAgent: "Mozilla/5.0 Chrome/130.0", setUserAgent: true, wantNextCalled: true, wantStatus: http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := CreateConfig()
+			cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/13[0-3]"}}
+			cfg.BypassPaths = []string{"/healthz", "/.well-known/"}
+
+			nextCalled := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
+			handler, err := New(context.Background(), next, cfg, "test")
+			if err != nil {
+				t.Fatalf("New returned error: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "http://example.com"+tt.path, nil)
+			if tt.setUserAgent {
+				req.Header.Set("User-Agent", tt.userAgent)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if nextCalled != tt.wantNextCalled {
+				t.Errorf("next called: got %v, want %v", nextCalled, tt.wantNextCalled)
+			}
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status: got %d, want %d", rec.Code, tt.wantStatus)
+			}
+		})
+	}
+}
+
+// TestServeHTTP_LogOnlyMode is the load-bearing assertion for mode=log-only:
+// requests that would have been blocked must still reach the next handler,
+// and the log line must clearly mark them as a would-block (not an enforced
+// block) so operators can distinguish staged rules from active ones.
+func TestServeHTTP_LogOnlyMode(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/13[0-3]"}}
+	cfg.Mode = ModeLogOnly
+
+	nextCalled := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusTeapot) // distinctive so we know it came from next
+	})
+	handler, err := New(context.Background(), next, cfg, "test")
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	var buf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOut)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("User-Agent", "WrongBrowser/1.0")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !nextCalled {
+		t.Fatal("log-only mode must forward would-be-blocked requests to next; next was not called")
+	}
+	if rec.Code != http.StatusTeapot {
+		t.Errorf("status: got %d, want %d (next handler's response should win)", rec.Code, http.StatusTeapot)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Would-Block") {
+		t.Errorf("log should contain 'Would-Block' marker in log-only mode, got: %s", out)
+	}
+	if strings.Contains(out, "Blocked (") {
+		t.Errorf("log must NOT use 'Blocked' verb in log-only mode (would confuse operators), got: %s", out)
+	}
+}

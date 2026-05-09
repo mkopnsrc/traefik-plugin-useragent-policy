@@ -27,6 +27,25 @@ Two optional knobs harden behavior in non-trivial deployments:
 
 Blocked-request log lines record the request **path** without the query string, so signed-URL tokens and session parameters carried in `?token=...` are not surfaced into logs.
 
+## Policy options
+
+These knobs change *which* requests get evaluated and *what happens* on a block decision. All are optional with safe defaults.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `mode` | `"enforce"` | `"enforce"` blocks matched requests with HTTP 403. `"log-only"` logs what *would* have been blocked (with a `Would-Block` marker so the line is distinguishable from a real block) and forwards the request to the next handler. Use `"log-only"` to stage new rules without breaking traffic. |
+| `bypassPaths` | `[]` | List of literal URL path prefixes (matched with `strings.HasPrefix` against `req.URL.Path`). Requests whose path matches any prefix skip *all* User-Agent checks and pass straight through. Intended for `/healthz`, `/.well-known/`, etc. — not regex, just literal prefix match. |
+| `action` (per `allowedBrowsers` entry) | `"allow"` | `"allow"` (or empty) means the rule grants access when matched. `"deny"` makes the rule block matched UAs even if a later allow rule would also match — useful for narrowly excluding known bad actors (e.g., `HeadlessChrome`) from a broader allowlist. **At least one entry must use `"allow"`**, otherwise no request could ever pass. |
+
+When both deny and allow rules are present, the evaluation order per request is:
+
+1. Path matches a `bypassPaths` prefix → forward immediately.
+2. Empty `User-Agent` → blocked (or would-block).
+3. Any deny rule matches → blocked (or would-block).
+4. No allow rule matches → blocked (or would-block).
+5. `allowedOSTypes` configured and none match → blocked (or would-block).
+6. Otherwise → forward.
+
 ## Usage
 1. Add the plugin to your Traefik configuration.
 2. Configure the plugin with the desired browser patterns.
@@ -79,9 +98,9 @@ http:
             - name: "Firefox"
               regex: "Firefox/13[1-5].*" # Firefox 131-135
             - name: "Edg" # Microsoft Edge
-              regex: "Edg/10[0-9]" # Edge 100-199
-            - name: "Brave" 
-              regex: "Brave/1.[7][5-9]" # Brave 1.75-1.99
+              regex: "Edg/10[0-9]" # Edge 100-109
+            - name: "Brave"
+              regex: "Brave/1\\.[7][5-9]" # Brave 1.75-1.79 (note: \. escapes the literal dot)
             - name: "CriOS" # Chrome for iOS
               regex: "CriOS/13[0-9]"
           allowedOSTypes:

@@ -11,21 +11,40 @@ import (
 	"strings"
 )
 
-// BrowserConfig defines configuration for a single browser.
+// Action values for BrowserConfig.Action.
+const (
+	ActionAllow = "allow"
+	ActionDeny  = "deny"
+)
+
+// Mode values for Config.Mode.
+const (
+	ModeEnforce = "enforce"
+	ModeLogOnly = "log-only"
+)
+
+// BrowserConfig defines configuration for a single browser rule.
 type BrowserConfig struct {
 	Name    string `json:"name"`              // Browser name (e.g., "Chrome")
-	Regex   string `json:"regex,omitempty"`   // Required: Exact regex pattern to match the browser
-	Version string `json:"version,omitempty"` // Unused: Kept for compatibility but ignored
+	Regex   string `json:"regex,omitempty"`   // Required: regex pattern to match the browser portion of the UA
+	Version string `json:"version,omitempty"` // Unused: kept for compatibility but ignored
+	// Action selects the rule's effect when the regex matches the User-Agent:
+	//   "allow" (default, or empty) — permit the request when the UA matches.
+	//   "deny"                      — block the request when the UA matches.
+	// Deny rules are evaluated before allow rules, so a deny match always wins.
+	// At least one rule with action="allow" must be configured; without one no
+	// request could ever pass.
+	Action string `json:"action,omitempty"`
 }
 
 // Config holds the plugin configuration.
 type Config struct {
-	AllowedBrowsers []BrowserConfig `json:"allowedBrowsers,omitempty"` // List of browser configs
-	AllowedOSTypes  []string        `json:"allowedOSTypes,omitempty"`  // Optional: List of allowed OS regex patterns
+	AllowedBrowsers []BrowserConfig `json:"allowedBrowsers,omitempty"` // Browser rules (allow and deny — see BrowserConfig.Action)
+	AllowedOSTypes  []string        `json:"allowedOSTypes,omitempty"`  // Optional: list of allowed OS regex patterns
 	// StrictMatch, when true, prepends \b to each browser/OS pattern so that
-	// matches must begin at a word boundary. This prevents accidental
-	// partial-word matches (e.g., "Chrome" matching inside "MyChrome"). It is
-	// NOT a defense against active spoofing — see README "Security".
+	// matches must begin at a word boundary. Prevents accidental partial-word
+	// matches (e.g., "Chrome" matching inside "MyChrome"). NOT a defense
+	// against active spoofing — see README "Security".
 	StrictMatch bool `json:"strictMatch,omitempty"`
 	// ClientIPHeader, when non-empty, names a request header whose first
 	// comma-separated value is used as the client IP in blocked-request logs
@@ -33,6 +52,17 @@ type Config struct {
 	// content is trusted verbatim; only enable when Traefik's
 	// forwardedHeaders.trustedIPs is configured to validate the source.
 	ClientIPHeader string `json:"clientIPHeader,omitempty"`
+	// Mode controls whether block decisions are enforced or only observed.
+	//   "enforce" (default, or empty) — block matched requests with 403.
+	//   "log-only"                    — log what would be blocked but forward
+	//                                   the request to the next handler. Useful
+	//                                   for staging new rules without impact.
+	Mode string `json:"mode,omitempty"`
+	// BypassPaths is a list of literal URL path prefixes (matched with
+	// strings.HasPrefix against req.URL.Path). Requests whose path matches any
+	// prefix skip all User-Agent checks and pass straight to the next handler.
+	// Intended for health checks, well-known endpoints, etc.
+	BypassPaths []string `json:"bypassPaths,omitempty"`
 }
 
 // CreateConfig creates and initializes the plugin configuration.
@@ -47,13 +77,16 @@ func CreateConfig() *Config {
 type BlockUserAgents struct {
 	name           string
 	next           http.Handler
-	regexpsAllow   []*regexp.Regexp // Browser regex patterns
-	osRegexpsAllow []*regexp.Regexp // OS regex patterns (optional)
+	regexpsAllow   []*regexp.Regexp // Browser allow patterns
+	regexpsDeny    []*regexp.Regexp // Browser deny patterns (checked first)
+	osRegexpsAllow []*regexp.Regexp // OS allow patterns (optional)
 	clientIPHeader string           // Header to read for client IP in logs (optional)
+	bypassPaths    []string         // Literal path prefixes that skip all checks
+	logOnly        bool             // When true, log block decisions but forward the request
 }
 
-// BlockUserAgentsMessage struct for logging blocked requests. The "uri" field
-// holds the request path only; query strings are intentionally omitted to
+// BlockUserAgentsMessage is the JSON shape of the blocked-request log line.
+// The "uri" field holds the request path only; query strings are omitted to
 // avoid leaking tokens or other sensitive parameters into logs.
 type BlockUserAgentsMessage struct {
 	UserAgent  string `json:"user-agent"`
@@ -65,12 +98,30 @@ type BlockUserAgentsMessage struct {
 // ValidateConfig validates the plugin configuration.
 func ValidateConfig(config *Config) error {
 	if len(config.AllowedBrowsers) == 0 {
-		return fmt.Errorf("at least one allowed browser must be specified")
+		return fmt.Errorf("at least one browser rule must be specified")
 	}
+	allowCount := 0
 	for _, bc := range config.AllowedBrowsers {
 		if bc.Regex == "" {
 			return fmt.Errorf("regex must be provided for browser: %s", bc.Name)
 		}
+		switch bc.Action {
+		case "", ActionAllow:
+			allowCount++
+		case ActionDeny:
+			// no-op
+		default:
+			return fmt.Errorf("invalid action %q for browser %s (must be %q or %q)", bc.Action, bc.Name, ActionAllow, ActionDeny)
+		}
+	}
+	if allowCount == 0 {
+		return fmt.Errorf("at least one browser rule with action %q is required", ActionAllow)
+	}
+	switch config.Mode {
+	case "", ModeEnforce, ModeLogOnly:
+		// ok
+	default:
+		return fmt.Errorf("invalid mode %q (must be %q or %q)", config.Mode, ModeEnforce, ModeLogOnly)
 	}
 	return nil
 }
@@ -81,15 +132,20 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		return nil, err
 	}
 	regexpsAllow := make([]*regexp.Regexp, 0, len(config.AllowedBrowsers))
+	regexpsDeny := make([]*regexp.Regexp, 0)
 	osRegexpsAllow := make([]*regexp.Regexp, 0, len(config.AllowedOSTypes))
 
-	// Compile regex patterns for allowed browsers
+	// Compile browser patterns into allow/deny buckets
 	for _, bc := range config.AllowedBrowsers {
 		re, err := regexp.Compile(maybeAnchor(bc.Regex, config.StrictMatch))
 		if err != nil {
 			return nil, fmt.Errorf("error compiling browser regex for %s: %w", bc.Name, err)
 		}
-		regexpsAllow = append(regexpsAllow, re)
+		if bc.Action == ActionDeny {
+			regexpsDeny = append(regexpsDeny, re)
+		} else {
+			regexpsAllow = append(regexpsAllow, re)
+		}
 	}
 
 	// Compile regex patterns for allowed OS types (if provided)
@@ -105,8 +161,11 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		name:           name,
 		next:           next,
 		regexpsAllow:   regexpsAllow,
+		regexpsDeny:    regexpsDeny,
 		osRegexpsAllow: osRegexpsAllow,
 		clientIPHeader: config.ClientIPHeader,
+		bypassPaths:    config.BypassPaths,
+		logOnly:        config.Mode == ModeLogOnly,
 	}, nil
 }
 
@@ -122,14 +181,29 @@ func maybeAnchor(pattern string, strict bool) string {
 
 // ServeHTTP handles the HTTP request.
 func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+	// Bypass paths skip all checks.
+	for _, prefix := range b.bypassPaths {
+		if strings.HasPrefix(req.URL.Path, prefix) {
+			b.next.ServeHTTP(res, req)
+			return
+		}
+	}
+
 	userAgent := req.UserAgent()
 	if userAgent == "" {
-		b.logBlockedRequest(req, "No User-Agent")
-		res.WriteHeader(http.StatusForbidden)
+		b.deny(res, req, "No User-Agent")
 		return
 	}
 
-	// Check browser patterns
+	// Deny rules first — a match here blocks regardless of allow rules.
+	for _, re := range b.regexpsDeny {
+		if re.MatchString(userAgent) {
+			b.deny(res, req, "Denied Browser")
+			return
+		}
+	}
+
+	// Allow rules — at least one must match.
 	browserMatch := false
 	for _, re := range b.regexpsAllow {
 		if re.MatchString(userAgent) {
@@ -138,12 +212,11 @@ func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 		}
 	}
 	if !browserMatch {
-		b.logBlockedRequest(req, "Unsupported Browser")
-		res.WriteHeader(http.StatusForbidden)
+		b.deny(res, req, "Unsupported Browser")
 		return
 	}
 
-	// Check OS patterns if provided
+	// OS rules if configured — at least one must match.
 	if len(b.osRegexpsAllow) > 0 {
 		osMatch := false
 		for _, re := range b.osRegexpsAllow {
@@ -153,13 +226,23 @@ func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 			}
 		}
 		if !osMatch {
-			b.logBlockedRequest(req, "Unsupported OS")
-			res.WriteHeader(http.StatusForbidden)
+			b.deny(res, req, "Unsupported OS")
 			return
 		}
 	}
 
 	b.next.ServeHTTP(res, req)
+}
+
+// deny logs the block decision and either short-circuits with 403 (enforce
+// mode) or forwards to the next handler (log-only mode).
+func (b *BlockUserAgents) deny(res http.ResponseWriter, req *http.Request, reason string) {
+	b.logBlockedRequest(req, reason)
+	if b.logOnly {
+		b.next.ServeHTTP(res, req)
+		return
+	}
+	res.WriteHeader(http.StatusForbidden)
 }
 
 // clientIP returns the client IP for logging. When ClientIPHeader is
@@ -179,8 +262,9 @@ func (b *BlockUserAgents) clientIP(req *http.Request) string {
 	return strings.TrimSpace(raw)
 }
 
-// logBlockedRequest logs details of a blocked request. The request path is
-// logged without the query string to avoid surfacing tokens in logs.
+// logBlockedRequest logs details of a blocked request. In log-only mode the
+// "Blocked" prefix becomes "Would-Block" so the log clearly distinguishes a
+// staged rule from an enforced one.
 func (b *BlockUserAgents) logBlockedRequest(req *http.Request, reason string) {
 	message := &BlockUserAgentsMessage{
 		UserAgent:  req.UserAgent(),
@@ -188,10 +272,14 @@ func (b *BlockUserAgents) logBlockedRequest(req *http.Request, reason string) {
 		Host:       req.Host,
 		RequestURI: req.URL.Path,
 	}
+	verb := "Blocked"
+	if b.logOnly {
+		verb = "Would-Block"
+	}
 	jsonMessage, err := json.Marshal(message)
 	if err == nil {
-		log.Printf("%s: Blocked (%s) - %s", b.name, reason, jsonMessage)
+		log.Printf("%s: %s (%s) - %s", b.name, verb, reason, jsonMessage)
 	} else {
-		log.Printf("%s: Blocked (%s) - %s", b.name, reason, req.UserAgent())
+		log.Printf("%s: %s (%s) - %s", b.name, verb, reason, req.UserAgent())
 	}
 }
