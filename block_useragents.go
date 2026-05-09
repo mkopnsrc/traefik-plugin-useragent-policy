@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // Action values for BrowserConfig.Action.
@@ -63,6 +65,18 @@ type Config struct {
 	// prefix skip all User-Agent checks and pass straight to the next handler.
 	// Intended for health checks, well-known endpoints, etc.
 	BypassPaths []string `json:"bypassPaths,omitempty"`
+	// MetricsLogInterval, when set to a positive Go duration string (e.g.
+	// "60s", "5m"), starts a background goroutine that emits a single JSON
+	// summary of the plugin's atomic counters at that interval. The goroutine
+	// respects the context.Context passed to New() and exits on cancellation,
+	// so Traefik plugin reloads do not leak goroutines. Default "" — disabled.
+	MetricsLogInterval string `json:"metricsLogInterval,omitempty"`
+	// LogSampleN, when greater than 1, suppresses per-reason blocked-request
+	// log lines so that only every Nth occurrence is logged (e.g. LogSampleN=
+	// 100 logs roughly 1% of blocks per reason). Reduces log volume during
+	// floods. The first occurrence of each reason is always logged. Has no
+	// effect on metrics counters. Default 0/1 — log every block.
+	LogSampleN int `json:"logSampleN,omitempty"`
 }
 
 // CreateConfig creates and initializes the plugin configuration.
@@ -83,6 +97,30 @@ type BlockUserAgents struct {
 	clientIPHeader string           // Header to read for client IP in logs (optional)
 	bypassPaths    []string         // Literal path prefixes that skip all checks
 	logOnly        bool             // When true, log block decisions but forward the request
+	logSampleN     uint64           // Per-reason log-sampling stride; 0/1 = log all
+
+	// Atomic cumulative counters. Read via the metrics-log goroutine and at
+	// test time; never reset. metricsSnapshot is the JSON shape of a summary
+	// log line.
+	cntTotal      atomic.Uint64
+	cntAllowed    atomic.Uint64
+	cntBypass     atomic.Uint64
+	cntNoUA       atomic.Uint64
+	cntDenied     atomic.Uint64
+	cntBadBrowser atomic.Uint64
+	cntBadOS      atomic.Uint64
+}
+
+// metricsSnapshot is the JSON payload emitted by the periodic metrics-log
+// goroutine. Cumulative — operators compute rates by diffing snapshots.
+type metricsSnapshot struct {
+	Total          uint64 `json:"total"`
+	Allowed        uint64 `json:"allowed"`
+	Bypass         uint64 `json:"bypass"`
+	BlockedNoUA    uint64 `json:"blocked_no_ua"`
+	BlockedDeny    uint64 `json:"blocked_deny"`
+	BlockedBrowser uint64 `json:"blocked_browser"`
+	BlockedOS      uint64 `json:"blocked_os"`
 }
 
 // BlockUserAgentsMessage is the JSON shape of the blocked-request log line.
@@ -123,11 +161,19 @@ func ValidateConfig(config *Config) error {
 	default:
 		return fmt.Errorf("invalid mode %q (must be %q or %q)", config.Mode, ModeEnforce, ModeLogOnly)
 	}
+	if config.LogSampleN < 0 {
+		return fmt.Errorf("logSampleN must be >= 0, got %d", config.LogSampleN)
+	}
+	if config.MetricsLogInterval != "" {
+		if _, err := time.ParseDuration(config.MetricsLogInterval); err != nil {
+			return fmt.Errorf("metricsLogInterval %q is not a valid duration: %w", config.MetricsLogInterval, err)
+		}
+	}
 	return nil
 }
 
 // New creates and returns a plugin instance.
-func New(_ context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	if err := ValidateConfig(config); err != nil {
 		return nil, err
 	}
@@ -157,7 +203,7 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		osRegexpsAllow = append(osRegexpsAllow, re)
 	}
 
-	return &BlockUserAgents{
+	b := &BlockUserAgents{
 		name:           name,
 		next:           next,
 		regexpsAllow:   regexpsAllow,
@@ -166,7 +212,20 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		clientIPHeader: config.ClientIPHeader,
 		bypassPaths:    config.BypassPaths,
 		logOnly:        config.Mode == ModeLogOnly,
-	}, nil
+		logSampleN:     uint64(config.LogSampleN),
+	}
+
+	// Periodic metrics summary, gated by config. The goroutine exits when
+	// ctx is cancelled (Traefik plugin teardown), so reloads do not leak.
+	if config.MetricsLogInterval != "" {
+		// Already validated parseable in ValidateConfig.
+		interval, _ := time.ParseDuration(config.MetricsLogInterval)
+		if interval > 0 {
+			go b.metricsLogLoop(ctx, interval)
+		}
+	}
+
+	return b, nil
 }
 
 // maybeAnchor wraps the user pattern with a leading word boundary when strict
@@ -181,9 +240,12 @@ func maybeAnchor(pattern string, strict bool) string {
 
 // ServeHTTP handles the HTTP request.
 func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+	b.cntTotal.Add(1)
+
 	// Bypass paths skip all checks.
 	for _, prefix := range b.bypassPaths {
 		if strings.HasPrefix(req.URL.Path, prefix) {
+			b.cntBypass.Add(1)
 			b.next.ServeHTTP(res, req)
 			return
 		}
@@ -191,14 +253,14 @@ func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 
 	userAgent := req.UserAgent()
 	if userAgent == "" {
-		b.deny(res, req, "No User-Agent")
+		b.deny(res, req, "No User-Agent", &b.cntNoUA)
 		return
 	}
 
 	// Deny rules first — a match here blocks regardless of allow rules.
 	for _, re := range b.regexpsDeny {
 		if re.MatchString(userAgent) {
-			b.deny(res, req, "Denied Browser")
+			b.deny(res, req, "Denied Browser", &b.cntDenied)
 			return
 		}
 	}
@@ -212,7 +274,7 @@ func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 		}
 	}
 	if !browserMatch {
-		b.deny(res, req, "Unsupported Browser")
+		b.deny(res, req, "Unsupported Browser", &b.cntBadBrowser)
 		return
 	}
 
@@ -226,23 +288,73 @@ func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 			}
 		}
 		if !osMatch {
-			b.deny(res, req, "Unsupported OS")
+			b.deny(res, req, "Unsupported OS", &b.cntBadOS)
 			return
 		}
 	}
 
+	b.cntAllowed.Add(1)
 	b.next.ServeHTTP(res, req)
 }
 
-// deny logs the block decision and either short-circuits with 403 (enforce
-// mode) or forwards to the next handler (log-only mode).
-func (b *BlockUserAgents) deny(res http.ResponseWriter, req *http.Request, reason string) {
-	b.logBlockedRequest(req, reason)
+// deny logs the block decision (subject to per-reason sampling) and either
+// short-circuits with 403 (enforce mode) or forwards to the next handler
+// (log-only mode). counter is the per-reason atomic that drives both metrics
+// and the sampling stride.
+func (b *BlockUserAgents) deny(res http.ResponseWriter, req *http.Request, reason string, counter *atomic.Uint64) {
+	n := counter.Add(1)
+	if b.shouldLog(n) {
+		b.logBlockedRequest(req, reason)
+	}
 	if b.logOnly {
 		b.next.ServeHTTP(res, req)
 		return
 	}
 	res.WriteHeader(http.StatusForbidden)
+}
+
+// shouldLog returns true if the n-th occurrence of a given reason should be
+// logged under the current sampling stride. Stride 0 or 1 logs every line.
+// Stride N>1 logs the 1st, (N+1)-th, (2N+1)-th, ... occurrence per reason.
+func (b *BlockUserAgents) shouldLog(n uint64) bool {
+	if b.logSampleN <= 1 {
+		return true
+	}
+	return n%b.logSampleN == 1
+}
+
+// metricsLogLoop emits a single JSON summary line every interval until ctx
+// is cancelled. Started by New() when MetricsLogInterval is configured.
+func (b *BlockUserAgents) metricsLogLoop(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			b.logMetricsSnapshot()
+		}
+	}
+}
+
+// logMetricsSnapshot reads the atomic counters and emits one JSON log line
+// prefixed with the middleware name. Cumulative numbers — operators diff
+// successive snapshots to compute rates.
+func (b *BlockUserAgents) logMetricsSnapshot() {
+	snap := metricsSnapshot{
+		Total:          b.cntTotal.Load(),
+		Allowed:        b.cntAllowed.Load(),
+		Bypass:         b.cntBypass.Load(),
+		BlockedNoUA:    b.cntNoUA.Load(),
+		BlockedDeny:    b.cntDenied.Load(),
+		BlockedBrowser: b.cntBadBrowser.Load(),
+		BlockedOS:      b.cntBadOS.Load(),
+	}
+	out, err := json.Marshal(snap)
+	if err == nil {
+		log.Printf("%s: metrics - %s", b.name, out)
+	}
 }
 
 // clientIP returns the client IP for logging. When ClientIPHeader is
