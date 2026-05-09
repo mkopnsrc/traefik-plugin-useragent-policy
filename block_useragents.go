@@ -88,17 +88,15 @@ func CreateConfig() *Config {
 }
 
 // BlockUserAgents struct.
+//
+// IMPORTANT: 64-bit fields come first. On 32-bit platforms (ARMv6, ARMv7,
+// 386, 32-bit MIPS) — Traefik ships armv6/armv7 builds — atomic operations
+// on a uint64 panic at runtime if the field is not 8-byte aligned. The
+// first word of an allocated struct is guaranteed 8-byte aligned, and
+// consecutive uint64 fields stay aligned, so keeping all atomic counters
+// (and logSampleN, also uint64) at the top of the struct prevents a class
+// of "passes amd64 CI, crashes the user's Pi at 3am" bugs. Do not reorder.
 type BlockUserAgents struct {
-	name           string
-	next           http.Handler
-	regexpsAllow   []*regexp.Regexp // Browser allow patterns
-	regexpsDeny    []*regexp.Regexp // Browser deny patterns (checked first)
-	osRegexpsAllow []*regexp.Regexp // OS allow patterns (optional)
-	clientIPHeader string           // Header to read for client IP in logs (optional)
-	bypassPaths    []string         // Literal path prefixes that skip all checks
-	logOnly        bool             // When true, log block decisions but forward the request
-	logSampleN     uint64           // Per-reason log-sampling stride; 0/1 = log all
-
 	// Cumulative counters, read via the metrics-log goroutine and at test
 	// time; never reset. Plain uint64 fields with sync/atomic free-function
 	// access (atomic.AddUint64, atomic.LoadUint64) — the typed atomic.Uint64
@@ -111,6 +109,16 @@ type BlockUserAgents struct {
 	cntDenied     uint64
 	cntBadBrowser uint64
 	cntBadOS      uint64
+	logSampleN    uint64 // Per-reason log-sampling stride; 0/1 = log all
+
+	name           string
+	next           http.Handler
+	regexpsAllow   []*regexp.Regexp // Browser allow patterns
+	regexpsDeny    []*regexp.Regexp // Browser deny patterns (checked first)
+	osRegexpsAllow []*regexp.Regexp // OS allow patterns (optional)
+	clientIPHeader string           // Header to read for client IP in logs (optional)
+	bypassPaths    []string         // Literal path prefixes that skip all checks
+	logOnly        bool             // When true, log block decisions but forward the request
 }
 
 // metricsSnapshot is the JSON payload emitted by the periodic metrics-log
@@ -171,6 +179,11 @@ func ValidateConfig(config *Config) error {
 			return fmt.Errorf("metricsLogInterval %q is not a valid duration: %w", config.MetricsLogInterval, err)
 		}
 	}
+	for i, p := range config.BypassPaths {
+		if p == "" {
+			return fmt.Errorf("bypassPaths[%d] is empty (an empty prefix would match every request and disable all UA checks)", i)
+		}
+	}
 	return nil
 }
 
@@ -218,7 +231,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	// Periodic metrics summary, gated by config. The goroutine exits when
-	// ctx is cancelled (Traefik plugin teardown), so reloads do not leak.
+	// ctx is canceled (Traefik plugin teardown), so reloads do not leak.
 	if config.MetricsLogInterval != "" {
 		// Already validated parseable in ValidateConfig.
 		interval, _ := time.ParseDuration(config.MetricsLogInterval)
@@ -326,7 +339,7 @@ func (b *BlockUserAgents) shouldLog(n uint64) bool {
 }
 
 // metricsLogLoop emits a single JSON summary line every interval until ctx
-// is cancelled. Started by New() when MetricsLogInterval is configured.
+// is canceled. Started by New() when MetricsLogInterval is configured.
 func (b *BlockUserAgents) metricsLogLoop(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()

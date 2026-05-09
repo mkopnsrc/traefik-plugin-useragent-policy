@@ -67,6 +67,10 @@ Counter fields in the periodic summary line:
 
 Counters are cumulative — derive rates by diffing successive snapshots in your log pipeline. Each Traefik router instance gets its own counter set; the middleware `name` prefix on each log line lets you keep them separate.
 
+Counters in a snapshot are read independently, so `total` may briefly differ from `bypass + allowed + sum(blocked_*)` if a request is in flight when the snapshot is taken. The skew is at most one in-flight request per worker; rates derived from snapshot diffs are unaffected.
+
+`bypassPaths` matches against `req.URL.Path` as received — the path is **not** normalized, so `/healthz/../admin` matches the prefix `/healthz`. Configure bypass entries only for trusted endpoints (health checks, well-known paths) where a path-traversed request reaching the next handler would not represent privilege escalation.
+
 ## Usage
 1. Add the plugin to your Traefik configuration.
 2. Configure the plugin with the desired browser patterns.
