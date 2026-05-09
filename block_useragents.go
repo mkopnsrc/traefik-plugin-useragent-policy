@@ -99,16 +99,18 @@ type BlockUserAgents struct {
 	logOnly        bool             // When true, log block decisions but forward the request
 	logSampleN     uint64           // Per-reason log-sampling stride; 0/1 = log all
 
-	// Atomic cumulative counters. Read via the metrics-log goroutine and at
-	// test time; never reset. metricsSnapshot is the JSON shape of a summary
-	// log line.
-	cntTotal      atomic.Uint64
-	cntAllowed    atomic.Uint64
-	cntBypass     atomic.Uint64
-	cntNoUA       atomic.Uint64
-	cntDenied     atomic.Uint64
-	cntBadBrowser atomic.Uint64
-	cntBadOS      atomic.Uint64
+	// Cumulative counters, read via the metrics-log goroutine and at test
+	// time; never reset. Plain uint64 fields with sync/atomic free-function
+	// access (atomic.AddUint64, atomic.LoadUint64) — the typed atomic.Uint64
+	// struct is Go 1.19+ and is not reliably available in Yaegi, which is
+	// what Traefik uses to load this plugin.
+	cntTotal      uint64
+	cntAllowed    uint64
+	cntBypass     uint64
+	cntNoUA       uint64
+	cntDenied     uint64
+	cntBadBrowser uint64
+	cntBadOS      uint64
 }
 
 // metricsSnapshot is the JSON payload emitted by the periodic metrics-log
@@ -240,12 +242,12 @@ func maybeAnchor(pattern string, strict bool) string {
 
 // ServeHTTP handles the HTTP request.
 func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) {
-	b.cntTotal.Add(1)
+	atomic.AddUint64(&b.cntTotal, 1)
 
 	// Bypass paths skip all checks.
 	for _, prefix := range b.bypassPaths {
 		if strings.HasPrefix(req.URL.Path, prefix) {
-			b.cntBypass.Add(1)
+			atomic.AddUint64(&b.cntBypass, 1)
 			b.next.ServeHTTP(res, req)
 			return
 		}
@@ -293,16 +295,16 @@ func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 		}
 	}
 
-	b.cntAllowed.Add(1)
+	atomic.AddUint64(&b.cntAllowed, 1)
 	b.next.ServeHTTP(res, req)
 }
 
 // deny logs the block decision (subject to per-reason sampling) and either
 // short-circuits with 403 (enforce mode) or forwards to the next handler
-// (log-only mode). counter is the per-reason atomic that drives both metrics
-// and the sampling stride.
-func (b *BlockUserAgents) deny(res http.ResponseWriter, req *http.Request, reason string, counter *atomic.Uint64) {
-	n := counter.Add(1)
+// (log-only mode). counter is the per-reason cumulative counter that drives
+// both metrics and the sampling stride.
+func (b *BlockUserAgents) deny(res http.ResponseWriter, req *http.Request, reason string, counter *uint64) {
+	n := atomic.AddUint64(counter, 1)
 	if b.shouldLog(n) {
 		b.logBlockedRequest(req, reason)
 	}
@@ -343,13 +345,13 @@ func (b *BlockUserAgents) metricsLogLoop(ctx context.Context, interval time.Dura
 // successive snapshots to compute rates.
 func (b *BlockUserAgents) logMetricsSnapshot() {
 	snap := metricsSnapshot{
-		Total:          b.cntTotal.Load(),
-		Allowed:        b.cntAllowed.Load(),
-		Bypass:         b.cntBypass.Load(),
-		BlockedNoUA:    b.cntNoUA.Load(),
-		BlockedDeny:    b.cntDenied.Load(),
-		BlockedBrowser: b.cntBadBrowser.Load(),
-		BlockedOS:      b.cntBadOS.Load(),
+		Total:          atomic.LoadUint64(&b.cntTotal),
+		Allowed:        atomic.LoadUint64(&b.cntAllowed),
+		Bypass:         atomic.LoadUint64(&b.cntBypass),
+		BlockedNoUA:    atomic.LoadUint64(&b.cntNoUA),
+		BlockedDeny:    atomic.LoadUint64(&b.cntDenied),
+		BlockedBrowser: atomic.LoadUint64(&b.cntBadBrowser),
+		BlockedOS:      atomic.LoadUint64(&b.cntBadOS),
 	}
 	out, err := json.Marshal(snap)
 	if err == nil {
