@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -494,13 +495,13 @@ func TestServeHTTP_CountersIncrement(t *testing.T) {
 		"blocked_os":      1,
 	}
 	got := map[string]uint64{
-		"total":           b.cntTotal.Load(),
-		"allowed":         b.cntAllowed.Load(),
-		"bypass":          b.cntBypass.Load(),
-		"blocked_no_ua":   b.cntNoUA.Load(),
-		"blocked_deny":    b.cntDenied.Load(),
-		"blocked_browser": b.cntBadBrowser.Load(),
-		"blocked_os":      b.cntBadOS.Load(),
+		"total":           atomic.LoadUint64(&b.cntTotal),
+		"allowed":         atomic.LoadUint64(&b.cntAllowed),
+		"bypass":          atomic.LoadUint64(&b.cntBypass),
+		"blocked_no_ua":   atomic.LoadUint64(&b.cntNoUA),
+		"blocked_deny":    atomic.LoadUint64(&b.cntDenied),
+		"blocked_browser": atomic.LoadUint64(&b.cntBadBrowser),
+		"blocked_os":      atomic.LoadUint64(&b.cntBadOS),
 	}
 	for k, want := range want {
 		if got[k] != want {
@@ -537,8 +538,12 @@ func TestShouldLog(t *testing.T) {
 
 // TestServeHTTP_LogSamplingSuppresses verifies that with LogSampleN > 1 the
 // log line emission rate per reason is throttled, while metrics counters
-// still increment for every block. Per-reason independence is verified by
-// flooding two reasons in interleaved fashion.
+// still increment for every block. The first occurrence of each reason MUST
+// log (operators need to see when a reason starts firing) — that's pinned
+// down with the after-request-1 / after-request-2 buffer-length checks
+// rather than only via the final count, so a future change to the sampling
+// formula that still happens to produce 2 lines per 10 requests would still
+// fail this test if it skipped the first occurrence.
 func TestServeHTTP_LogSamplingSuppresses(t *testing.T) {
 	cfg := CreateConfig()
 	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/13[0-3]"}}
@@ -555,23 +560,44 @@ func TestServeHTTP_LogSamplingSuppresses(t *testing.T) {
 	log.SetOutput(&buf)
 	defer log.SetOutput(origOut)
 
-	// 10 unsupported-browser requests -> log lines at n=1 and n=6 = 2 lines.
-	for i := 0; i < 10; i++ {
+	send := func(ua string) {
 		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
-		req.Header.Set("User-Agent", "OldBrowser/1.0")
-		handler.ServeHTTP(httptest.NewRecorder(), req)
-	}
-	// 10 no-UA requests -> log lines at n=1 and n=6 = 2 lines.
-	for i := 0; i < 10; i++ {
-		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
+		}
 		handler.ServeHTTP(httptest.NewRecorder(), req)
 	}
 
+	// First blocked request must produce a log line — operators rely on
+	// seeing when a reason starts firing, even with aggressive sampling.
+	send("OldBrowser/1.0")
+	if buf.Len() == 0 {
+		t.Fatal("first blocked request produced no log line; first occurrence per reason must always log")
+	}
+	afterFirst := buf.Len()
+
+	// Second blocked request (n=2 with stride=5) must NOT add a log line.
+	send("OldBrowser/1.0")
+	if buf.Len() != afterFirst {
+		t.Errorf("second blocked request produced an extra log line; expected stride=5 to suppress n=2")
+	}
+
+	// Send 8 more to bring the total to 10. Combined with the first 2 we
+	// expect exactly 2 lines for 'Unsupported Browser' (n=1 and n=6).
+	for i := 0; i < 8; i++ {
+		send("OldBrowser/1.0")
+	}
+	// And 10 no-UA requests, interleaved-effect verified by per-reason
+	// counter independence below.
+	for i := 0; i < 10; i++ {
+		send("")
+	}
+
 	// All blocks must be counted regardless of sampling.
-	if got := b.cntBadBrowser.Load(); got != 10 {
+	if got := atomic.LoadUint64(&b.cntBadBrowser); got != 10 {
 		t.Errorf("cntBadBrowser: got %d, want 10", got)
 	}
-	if got := b.cntNoUA.Load(); got != 10 {
+	if got := atomic.LoadUint64(&b.cntNoUA); got != 10 {
 		t.Errorf("cntNoUA: got %d, want 10", got)
 	}
 
@@ -596,13 +622,13 @@ func TestLogMetricsSnapshot(t *testing.T) {
 		t.Fatalf("New returned error: %v", err)
 	}
 	b := handler.(*BlockUserAgents)
-	b.cntTotal.Store(42)
-	b.cntAllowed.Store(30)
-	b.cntBypass.Store(2)
-	b.cntNoUA.Store(3)
-	b.cntDenied.Store(4)
-	b.cntBadBrowser.Store(2)
-	b.cntBadOS.Store(1)
+	atomic.StoreUint64(&b.cntTotal, 42)
+	atomic.StoreUint64(&b.cntAllowed, 30)
+	atomic.StoreUint64(&b.cntBypass, 2)
+	atomic.StoreUint64(&b.cntNoUA, 3)
+	atomic.StoreUint64(&b.cntDenied, 4)
+	atomic.StoreUint64(&b.cntBadBrowser, 2)
+	atomic.StoreUint64(&b.cntBadOS, 1)
 
 	var buf bytes.Buffer
 	origOut := log.Writer()
