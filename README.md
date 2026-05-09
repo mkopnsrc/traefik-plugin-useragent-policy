@@ -46,6 +46,27 @@ When both deny and allow rules are present, the evaluation order per request is:
 5. `allowedOSTypes` configured and none match → blocked (or would-block).
 6. Otherwise → forward.
 
+## Observability
+
+The plugin maintains in-memory atomic counters for every request and supports per-reason log sampling. There is no HTTP metrics endpoint — middlewares cannot add routes, and Traefik's metrics layer is not reachable from a Yaegi-loaded plugin. Instead, metrics are emitted as a periodic JSON log line that you can scrape from your log pipeline.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `metricsLogInterval` | `""` (disabled) | Go duration string (e.g. `"60s"`, `"5m"`). When set to a positive duration, a background goroutine emits one JSON summary log line at that cadence. The goroutine is bound to the `context.Context` Traefik passes to `New()` and exits cleanly on plugin teardown — no leaks across config reloads. |
+| `logSampleN` | `0` (log all) | Per-reason log-sampling stride. `0` or `1` logs every blocked request. `N>1` logs the 1st, then every `N`th, occurrence per reason. Reduces log volume during floods. **Has no effect on counters** — every block still increments its counter. |
+
+Counter fields in the periodic summary line:
+
+- `total` — every request that entered the middleware
+- `allowed` — passed all checks and forwarded to next
+- `bypass` — matched a `bypassPaths` prefix and forwarded
+- `blocked_no_ua` — blocked due to empty `User-Agent`
+- `blocked_deny` — blocked by a `deny` rule
+- `blocked_browser` — blocked because no allow rule matched
+- `blocked_os` — blocked because no `allowedOSTypes` rule matched
+
+Counters are cumulative — derive rates by diffing successive snapshots in your log pipeline. Each Traefik router instance gets its own counter set; the middleware `name` prefix on each log line lets you keep them separate.
+
 ## Usage
 1. Add the plugin to your Traefik configuration.
 2. Configure the plugin with the desired browser patterns.

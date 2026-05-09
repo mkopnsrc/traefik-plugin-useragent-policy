@@ -3,11 +3,13 @@ package traefik_plugin_block_useragents
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func nopHandler() http.Handler {
@@ -415,6 +417,245 @@ func TestServeHTTP_BypassPaths(t *testing.T) {
 				t.Errorf("status: got %d, want %d", rec.Code, tt.wantStatus)
 			}
 		})
+	}
+}
+
+// TestNew_RejectsInvalidMetricsLogInterval verifies that an unparseable
+// duration string in MetricsLogInterval is caught at config-validation time
+// rather than silently producing a no-op goroutine.
+func TestNew_RejectsInvalidMetricsLogInterval(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/130"}}
+	cfg.MetricsLogInterval = "not-a-duration"
+	if _, err := New(context.Background(), nopHandler(), cfg, "test"); err == nil {
+		t.Fatal("expected error for invalid metricsLogInterval, got nil")
+	}
+}
+
+func TestNew_RejectsNegativeLogSampleN(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/130"}}
+	cfg.LogSampleN = -1
+	if _, err := New(context.Background(), nopHandler(), cfg, "test"); err == nil {
+		t.Fatal("expected error for negative logSampleN, got nil")
+	}
+}
+
+// TestServeHTTP_CountersIncrement drives traffic through every code path
+// and verifies the atomic counters end up with the right totals.
+func TestServeHTTP_CountersIncrement(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{
+		{Name: "Chrome", Regex: "Chrome/13[0-3]"},
+		{Name: "BadBot", Regex: "EvilBot", Action: ActionDeny},
+	}
+	cfg.AllowedOSTypes = []string{"Linux"}
+	cfg.BypassPaths = []string{"/healthz"}
+
+	handler, err := New(context.Background(), nopHandler(), cfg, "test")
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	b := handler.(*BlockUserAgents)
+
+	// Suppress log output during the noisy counter exercise.
+	origOut := log.Writer()
+	log.SetOutput(&bytes.Buffer{})
+	defer log.SetOutput(origOut)
+
+	type req struct {
+		path string
+		ua   string
+	}
+	for _, r := range []req{
+		{"/healthz", ""}, // bypass (no UA needed)
+		{"/healthz", "Mozilla/5.0 Chrome/130 Linux"}, // bypass
+		{"/api", ""},                             // no UA -> blocked
+		{"/api", "EvilBot/1.0"},                  // deny rule -> blocked
+		{"/api", "OldBrowser/1"},                 // unsupported browser -> blocked
+		{"/api", "Mozilla/5.0 Chrome/130 Mac"},   // browser ok, OS bad
+		{"/api", "Mozilla/5.0 Chrome/130 Linux"}, // allowed
+		{"/api", "Mozilla/5.0 Chrome/132 Linux"}, // allowed
+	} {
+		httpReq := httptest.NewRequest(http.MethodGet, "http://example.com"+r.path, nil)
+		if r.ua != "" {
+			httpReq.Header.Set("User-Agent", r.ua)
+		}
+		handler.ServeHTTP(httptest.NewRecorder(), httpReq)
+	}
+
+	want := map[string]uint64{
+		"total":           8,
+		"allowed":         2,
+		"bypass":          2,
+		"blocked_no_ua":   1,
+		"blocked_deny":    1,
+		"blocked_browser": 1,
+		"blocked_os":      1,
+	}
+	got := map[string]uint64{
+		"total":           b.cntTotal.Load(),
+		"allowed":         b.cntAllowed.Load(),
+		"bypass":          b.cntBypass.Load(),
+		"blocked_no_ua":   b.cntNoUA.Load(),
+		"blocked_deny":    b.cntDenied.Load(),
+		"blocked_browser": b.cntBadBrowser.Load(),
+		"blocked_os":      b.cntBadOS.Load(),
+	}
+	for k, want := range want {
+		if got[k] != want {
+			t.Errorf("counter %q: got %d, want %d", k, got[k], want)
+		}
+	}
+}
+
+// TestShouldLog verifies the per-reason sampling stride directly.
+func TestShouldLog(t *testing.T) {
+	tests := []struct {
+		stride   uint64
+		n        uint64
+		wantTrue bool
+	}{
+		{stride: 0, n: 1, wantTrue: true},
+		{stride: 0, n: 999, wantTrue: true},
+		{stride: 1, n: 1, wantTrue: true},
+		{stride: 1, n: 42, wantTrue: true},
+		{stride: 100, n: 1, wantTrue: true},   // first occurrence always logs
+		{stride: 100, n: 50, wantTrue: false}, // suppressed
+		{stride: 100, n: 100, wantTrue: false},
+		{stride: 100, n: 101, wantTrue: true}, // 100*1 + 1
+		{stride: 100, n: 201, wantTrue: true}, // 100*2 + 1
+		{stride: 100, n: 200, wantTrue: false},
+	}
+	for _, tt := range tests {
+		b := &BlockUserAgents{logSampleN: tt.stride}
+		if got := b.shouldLog(tt.n); got != tt.wantTrue {
+			t.Errorf("shouldLog(stride=%d, n=%d): got %v, want %v", tt.stride, tt.n, got, tt.wantTrue)
+		}
+	}
+}
+
+// TestServeHTTP_LogSamplingSuppresses verifies that with LogSampleN > 1 the
+// log line emission rate per reason is throttled, while metrics counters
+// still increment for every block. Per-reason independence is verified by
+// flooding two reasons in interleaved fashion.
+func TestServeHTTP_LogSamplingSuppresses(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/13[0-3]"}}
+	cfg.LogSampleN = 5
+
+	handler, err := New(context.Background(), nopHandler(), cfg, "test")
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	b := handler.(*BlockUserAgents)
+
+	var buf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOut)
+
+	// 10 unsupported-browser requests -> log lines at n=1 and n=6 = 2 lines.
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.Header.Set("User-Agent", "OldBrowser/1.0")
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	// 10 no-UA requests -> log lines at n=1 and n=6 = 2 lines.
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	// All blocks must be counted regardless of sampling.
+	if got := b.cntBadBrowser.Load(); got != 10 {
+		t.Errorf("cntBadBrowser: got %d, want 10", got)
+	}
+	if got := b.cntNoUA.Load(); got != 10 {
+		t.Errorf("cntNoUA: got %d, want 10", got)
+	}
+
+	browserLines := strings.Count(buf.String(), "Unsupported Browser")
+	noUALines := strings.Count(buf.String(), "No User-Agent")
+	if browserLines != 2 {
+		t.Errorf("expected 2 'Unsupported Browser' log lines (n=1,6 of 10 with stride=5), got %d", browserLines)
+	}
+	if noUALines != 2 {
+		t.Errorf("expected 2 'No User-Agent' log lines (n=1,6 of 10 with stride=5), got %d", noUALines)
+	}
+}
+
+// TestLogMetricsSnapshot verifies the JSON shape of a single emitted summary
+// line. Avoids fighting goroutine timing — calls the helper directly.
+func TestLogMetricsSnapshot(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/13[0-3]"}}
+
+	handler, err := New(context.Background(), nopHandler(), cfg, "test")
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	b := handler.(*BlockUserAgents)
+	b.cntTotal.Store(42)
+	b.cntAllowed.Store(30)
+	b.cntBypass.Store(2)
+	b.cntNoUA.Store(3)
+	b.cntDenied.Store(4)
+	b.cntBadBrowser.Store(2)
+	b.cntBadOS.Store(1)
+
+	var buf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOut)
+
+	b.logMetricsSnapshot()
+
+	out := buf.String()
+	idx := strings.Index(out, "{")
+	if idx < 0 {
+		t.Fatalf("no JSON in metrics log line: %s", out)
+	}
+	var snap metricsSnapshot
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out[idx:])), &snap); err != nil {
+		t.Fatalf("metrics line is not valid JSON: %v\n%s", err, out)
+	}
+	want := metricsSnapshot{Total: 42, Allowed: 30, Bypass: 2, BlockedNoUA: 3, BlockedDeny: 4, BlockedBrowser: 2, BlockedOS: 1}
+	if snap != want {
+		t.Errorf("snapshot: got %+v, want %+v", snap, want)
+	}
+}
+
+// TestMetricsLogLoop_RespectsContextCancellation is the load-bearing test
+// for the goroutine lifecycle: when the context passed to New is cancelled
+// (Traefik plugin teardown), the metrics goroutine must exit. Otherwise
+// every config reload leaks one goroutine.
+func TestMetricsLogLoop_RespectsContextCancellation(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.AllowedBrowsers = []BrowserConfig{{Name: "Chrome", Regex: "Chrome/13[0-3]"}}
+
+	handler, err := New(context.Background(), nopHandler(), cfg, "test")
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	b := handler.(*BlockUserAgents)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		b.metricsLogLoop(ctx, 10*time.Millisecond)
+		close(done)
+	}()
+
+	// Let it tick at least once.
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+		// goroutine exited as required
+	case <-time.After(time.Second):
+		t.Fatal("metricsLogLoop did not exit within 1s of context cancellation — goroutine leak risk")
 	}
 }
 
