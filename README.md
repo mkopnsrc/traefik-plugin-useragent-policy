@@ -137,6 +137,70 @@ http:
             - "iOS" # iOS
 ```
 
+### Recommended Production Configuration
+Anchored matching, real client IP from a trusted proxy header, and bypass for health checks / well-known paths. See **Security** and **Policy options** for the rationale behind each knob.
+```yaml
+http:
+  middlewares:
+    block-ua:
+      plugin:
+        block_useragents:
+          strictMatch: true                # \b-anchor each pattern; prevents partial-word matches
+          clientIPHeader: "X-Forwarded-For" # only when behind a trusted proxy that sets/strips this
+          bypassPaths:
+            - "/healthz"
+            - "/.well-known/"
+          allowedBrowsers:
+            - name: "Chrome"
+              regex: "Chrome/13[0-3]"
+            - name: "Firefox"
+              regex: "Firefox/13[1-5]"
+          allowedOSTypes:
+            - "Windows NT 10\\.0"
+            - "Mac OS X 10\\.[0-9]+"
+            - "Linux"
+            - "Android"
+            - "iOS"
+```
+
+### Mixing Allow and Deny Rules
+Per-rule `action` lets a narrow deny carve out specific UAs from a broader allow. Deny rules are evaluated before allow rules.
+```yaml
+http:
+  middlewares:
+    block-ua:
+      plugin:
+        block_useragents:
+          allowedBrowsers:
+            - name: "Chrome"
+              regex: "Chrome/13[0-3]"
+              # action: "allow" is the default and may be omitted
+            - name: "ChromeHeadless"        # carved out from the Chrome allow above
+              regex: "HeadlessChrome"
+              action: "deny"
+            - name: "PhantomJS"
+              regex: "PhantomJS"
+              action: "deny"
+```
+
+### Staged Rollout (log-only) with Observability
+Stage a stricter ruleset without breaking traffic: log what *would* be blocked, forward the request anyway, emit a metrics summary every minute, and sample noisy block reasons so the log volume stays manageable.
+```yaml
+http:
+  middlewares:
+    block-ua:
+      plugin:
+        block_useragents:
+          mode: "log-only"            # would-blocks log a "Would-Block" line and pass through
+          metricsLogInterval: "60s"   # one JSON summary log line per minute
+          logSampleN: 100             # log 1st + every 100th occurrence per reason
+          allowedBrowsers:
+            - name: "Chrome"
+              regex: "Chrome/13[0-3]"
+            - name: "Firefox"
+              regex: "Firefox/13[1-5]"
+```
+
 ## Router Usage
 ```yaml
 http:
