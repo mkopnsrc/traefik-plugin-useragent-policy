@@ -1,4 +1,4 @@
-package traefik_plugin_block_useragents
+package traefik_plugin_useragent_policy
 
 import (
 	"bytes"
@@ -237,7 +237,7 @@ func TestClientIP(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &BlockUserAgents{clientIPHeader: tt.headerName}
+			b := &UserAgentPolicy{clientIPHeader: tt.headerName}
 			req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
 			req.RemoteAddr = tt.remoteAddr
 			if tt.headerVal != "" {
@@ -471,7 +471,7 @@ func TestServeHTTP_CountersIncrement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
-	b := handler.(*BlockUserAgents)
+	b := handler.(*UserAgentPolicy)
 
 	// Suppress log output during the noisy counter exercise.
 	origOut := log.Writer()
@@ -543,7 +543,7 @@ func TestShouldLog(t *testing.T) {
 		{stride: 100, n: 200, wantTrue: false},
 	}
 	for _, tt := range tests {
-		b := &BlockUserAgents{logSampleN: tt.stride}
+		b := &UserAgentPolicy{logSampleN: tt.stride}
 		if got := b.shouldLog(tt.n); got != tt.wantTrue {
 			t.Errorf("shouldLog(stride=%d, n=%d): got %v, want %v", tt.stride, tt.n, got, tt.wantTrue)
 		}
@@ -567,7 +567,7 @@ func TestServeHTTP_LogSamplingSuppresses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
-	b := handler.(*BlockUserAgents)
+	b := handler.(*UserAgentPolicy)
 
 	var buf bytes.Buffer
 	origOut := log.Writer()
@@ -635,7 +635,7 @@ func TestLogMetricsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
-	b := handler.(*BlockUserAgents)
+	b := handler.(*UserAgentPolicy)
 	atomic.StoreUint64(&b.cntTotal, 42)
 	atomic.StoreUint64(&b.cntAllowed, 30)
 	atomic.StoreUint64(&b.cntBypass, 2)
@@ -678,7 +678,7 @@ func TestMetricsLogLoop_RespectsContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
-	b := handler.(*BlockUserAgents)
+	b := handler.(*UserAgentPolicy)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
