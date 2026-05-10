@@ -1,10 +1,10 @@
 # .traefik.yml
-displayName: Block User-Agents
+displayName: User-Agent Policy
 type: middleware
-import: github.com/mkopnsrc/traefik-plugin-block-useragents
-summary: Blocks HTTP requests based on User-Agent, checking browsers and optionally OS types.
+import: github.com/mkopnsrc/traefik-plugin-useragent-policy
+summary: Applies User-Agent allow/deny policy with optional OS filtering, log-only staging, and bypass paths.
 description: |
-  A Traefik middleware plugin that blocks requests unless the User-Agent matches user-defined browser patterns (via regex or version) and, optionally, OS patterns. Fully customizable with no external dependencies.
+  A Traefik middleware plugin that gates requests by User-Agent. Supports allow rules, per-rule deny exceptions, optional OS filtering, log-only staging, path bypass, and periodic metrics summaries. Fully customizable with no external dependencies.
 testData:
   allowedBrowsers:
     - name: "Chrome"

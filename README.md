@@ -1,18 +1,42 @@
-# Traefik Plugin: Block User-Agent
+# Traefik Plugin: User-Agent Policy
 
-A Traefik middleware plugin to block all HTTP requests by default and allowing only HTTP requests based on the user-specified `User-Agent` patterns for Browser and OS types.
+A Traefik middleware plugin that gates HTTP requests by `User-Agent` — deny by default, with allow rules (regex), optional per-rule deny exceptions, optional OS filtering, log-only staging for new rules, path bypass, and periodic in-memory metrics.
+
+> **Renamed from `traefik-plugin-block-useragents` in v0.8.0-alpha.** See **Migration** below if you're upgrading from v0.7.x.
 
 ## Features
-- Blocks all `User-Agent` by default.
-- Allows user-defined browsers via:
-  - Custom regex patterns (e.g., `MyBrowser/12[0-1].*`).
-- Optional OS type filtering with regex patterns. See example below.
-- No external APIs or caching; relies entirely on user configuration.
+- Blocks all `User-Agent`s by default.
+- Allows user-defined browsers via custom regex patterns (e.g., `MyBrowser/12[0-1].*`).
+- Per-rule `action: allow | deny` lets a narrow deny carve specific UAs out of a broader allow.
+- Optional OS type filtering with regex patterns. See examples below.
+- `mode: log-only` for staged rollout; `bypassPaths` for health checks; periodic JSON metrics summaries.
+- No external APIs, no third-party imports — single-file stdlib-only plugin.
 
 ## Notes
- - Requirements: At least one `allowedBrowsers` entry with `name` and it's `regex` is required.
+ - Requirements: At least one `allowedBrowsers` entry with `name` and its `regex` is required.
  - OS Patterns: `allowedOSTypes` expects regex patterns. Use exact strings (e.g., `Windows NT 10\.0`) or wildcards (e.g., `Android [8-9]\.[0-9]+`) as needed.
  - No Dependencies: The plugin is lightweight with no external dependencies.
+
+## Migration from `traefik-plugin-block-useragents`
+
+The repository was renamed from `traefik-plugin-block-useragents` to `traefik-plugin-useragent-policy` in **v0.8.0-alpha**. The change is module-path-only — no config field renames, no behavior changes, no API breakage in `CreateConfig` / `New`.
+
+**What you need to do:** update `moduleName` in your Traefik config:
+
+```diff
+ experimental:
+   plugins:
+-    block_useragents:
+-      moduleName: "github.com/mkopnsrc/traefik-plugin-block-useragents"
+-      version: "v0.7.1-alpha"
++    useragent_policy:
++      moduleName: "github.com/mkopnsrc/traefik-plugin-useragent-policy"
++      version: "v0.8.0-alpha"
+```
+
+And update any middleware references from `block_useragents:` to `useragent_policy:` (or whatever local key you choose) in the `http.middlewares` block.
+
+GitHub redirects requests for the old repo URL to the new one, so existing pinned-to-v0.7.x configs continue to resolve. New deployments should use the new path. Tags from v0.7.x and earlier remain published under the new repo.
 
 ## Security
 
@@ -80,8 +104,8 @@ Counters in a snapshot are read independently, so `total` may briefly differ fro
 ```yaml
 experimental:
   plugins:
-    block_useragents:
-      moduleName: "github.com/mkopnsrc/traefik-plugin-block-useragents"
+    useragent_policy:
+      moduleName: "github.com/mkopnsrc/traefik-plugin-useragent-policy"
       version: "v1.0" # Optional
 ```
 
@@ -90,8 +114,8 @@ experimental:
 ```yaml
 experimental:
   localPlugins:
-    block_useragents:
-      moduleName: "github.com/mkopnsrc/traefik-plugin-block-useragents"
+    useragent_policy:
+      moduleName: "github.com/mkopnsrc/traefik-plugin-useragent-policy"
 ```
 
 ## Middleware Configuration
@@ -101,7 +125,7 @@ http:
   middlewares:
     block-ua:
       plugin:
-        block_useragents:
+        useragent_policy:
           allowedBrowsers:
             - name: "Chrome"
               regex: "Chrome/13[0-3].*" # Chrome 130-133
@@ -116,7 +140,7 @@ http:
   middlewares:
     block-ua:
       plugin:
-        block_useragents:
+        useragent_policy:
           allowedBrowsers:
             - name: "Chrome"
               regex: "Chrome/13[0-3].*" # Chrome 130-133
@@ -144,7 +168,7 @@ http:
   middlewares:
     block-ua:
       plugin:
-        block_useragents:
+        useragent_policy:
           strictMatch: true                # \b-anchor each pattern; prevents partial-word matches
           clientIPHeader: "X-Forwarded-For" # only when behind a trusted proxy that sets/strips this
           bypassPaths:
@@ -170,7 +194,7 @@ http:
   middlewares:
     block-ua:
       plugin:
-        block_useragents:
+        useragent_policy:
           allowedBrowsers:
             - name: "Chrome"
               regex: "Chrome/13[0-3]"
@@ -190,7 +214,7 @@ http:
   middlewares:
     block-ua:
       plugin:
-        block_useragents:
+        useragent_policy:
           mode: "log-only"            # would-blocks log a "Would-Block" line and pass through
           metricsLogInterval: "60s"   # one JSON summary log line per minute
           logSampleN: 100             # log 1st + every 100th occurrence per reason
