@@ -32,5 +32,5 @@ max-issues-per-linter = 50
 max-same-issues = 10
 
 [[issues.exclude-rules]]
-path = "block_useragents.*\\.go"
+path = "useragent_policy.*\\.go"
 linters = ["revive"]

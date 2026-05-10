@@ -21,7 +21,7 @@ vulncheck:
 
 # Build the plugin (compile-only check; Traefik loads the plugin via Yaegi, not the .so)
 build:
-	go build -buildmode=plugin -o traefik-plugin-block-useragents.so block_useragents.go
+	go build -buildmode=plugin -o traefik-plugin-useragent-policy.so useragent_policy.go
 
 # Run tests
 test:
@@ -29,4 +29,4 @@ test:
 
 # Clean up generated files
 clean:
-	rm -f traefik-plugin-block-useragents.so
+	rm -f traefik-plugin-useragent-policy.so
