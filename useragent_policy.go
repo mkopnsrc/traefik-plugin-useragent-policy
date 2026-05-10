@@ -1,5 +1,7 @@
-// Package traefik_plugin_block_useragents provides a plugin to block User-Agent based on browsers and OS.
-package traefik_plugin_block_useragents
+// Package traefik_plugin_useragent_policy is a Traefik middleware that
+// applies User-Agent allow/deny policy with optional OS filtering, log-only
+// staging, and bypass paths.
+package traefik_plugin_useragent_policy
 
 import (
 	"context"
@@ -87,7 +89,7 @@ func CreateConfig() *Config {
 	}
 }
 
-// BlockUserAgents struct.
+// UserAgentPolicy struct.
 //
 // IMPORTANT: 64-bit fields come first. On 32-bit platforms (ARMv6, ARMv7,
 // 386, 32-bit MIPS) — Traefik ships armv6/armv7 builds — atomic operations
@@ -96,7 +98,7 @@ func CreateConfig() *Config {
 // consecutive uint64 fields stay aligned, so keeping all atomic counters
 // (and logSampleN, also uint64) at the top of the struct prevents a class
 // of "passes amd64 CI, crashes the user's Pi at 3am" bugs. Do not reorder.
-type BlockUserAgents struct {
+type UserAgentPolicy struct {
 	// Cumulative counters, read via the metrics-log goroutine and at test
 	// time; never reset. Plain uint64 fields with sync/atomic free-function
 	// access (atomic.AddUint64, atomic.LoadUint64) — the typed atomic.Uint64
@@ -133,10 +135,10 @@ type metricsSnapshot struct {
 	BlockedOS      uint64 `json:"blocked_os"`
 }
 
-// BlockUserAgentsMessage is the JSON shape of the blocked-request log line.
+// BlockedRequestLog is the JSON shape of the blocked-request log line.
 // The "uri" field holds the request path only; query strings are omitted to
 // avoid leaking tokens or other sensitive parameters into logs.
-type BlockUserAgentsMessage struct {
+type BlockedRequestLog struct {
 	UserAgent  string `json:"user-agent"`
 	RemoteAddr string `json:"ip"`
 	Host       string `json:"host"`
@@ -218,7 +220,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		osRegexpsAllow = append(osRegexpsAllow, re)
 	}
 
-	b := &BlockUserAgents{
+	b := &UserAgentPolicy{
 		name:           name,
 		next:           next,
 		regexpsAllow:   regexpsAllow,
@@ -254,7 +256,7 @@ func maybeAnchor(pattern string, strict bool) string {
 }
 
 // ServeHTTP handles the HTTP request.
-func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+func (b *UserAgentPolicy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	atomic.AddUint64(&b.cntTotal, 1)
 
 	// Bypass paths skip all checks.
@@ -316,7 +318,7 @@ func (b *BlockUserAgents) ServeHTTP(res http.ResponseWriter, req *http.Request) 
 // short-circuits with 403 (enforce mode) or forwards to the next handler
 // (log-only mode). counter is the per-reason cumulative counter that drives
 // both metrics and the sampling stride.
-func (b *BlockUserAgents) deny(res http.ResponseWriter, req *http.Request, reason string, counter *uint64) {
+func (b *UserAgentPolicy) deny(res http.ResponseWriter, req *http.Request, reason string, counter *uint64) {
 	n := atomic.AddUint64(counter, 1)
 	if b.shouldLog(n) {
 		b.logBlockedRequest(req, reason)
@@ -331,7 +333,7 @@ func (b *BlockUserAgents) deny(res http.ResponseWriter, req *http.Request, reaso
 // shouldLog returns true if the n-th occurrence of a given reason should be
 // logged under the current sampling stride. Stride 0 or 1 logs every line.
 // Stride N>1 logs the 1st, (N+1)-th, (2N+1)-th, ... occurrence per reason.
-func (b *BlockUserAgents) shouldLog(n uint64) bool {
+func (b *UserAgentPolicy) shouldLog(n uint64) bool {
 	if b.logSampleN <= 1 {
 		return true
 	}
@@ -340,7 +342,7 @@ func (b *BlockUserAgents) shouldLog(n uint64) bool {
 
 // metricsLogLoop emits a single JSON summary line every interval until ctx
 // is canceled. Started by New() when MetricsLogInterval is configured.
-func (b *BlockUserAgents) metricsLogLoop(ctx context.Context, interval time.Duration) {
+func (b *UserAgentPolicy) metricsLogLoop(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -356,7 +358,7 @@ func (b *BlockUserAgents) metricsLogLoop(ctx context.Context, interval time.Dura
 // logMetricsSnapshot reads the atomic counters and emits one JSON log line
 // prefixed with the middleware name. Cumulative numbers — operators diff
 // successive snapshots to compute rates.
-func (b *BlockUserAgents) logMetricsSnapshot() {
+func (b *UserAgentPolicy) logMetricsSnapshot() {
 	snap := metricsSnapshot{
 		Total:          atomic.LoadUint64(&b.cntTotal),
 		Allowed:        atomic.LoadUint64(&b.cntAllowed),
@@ -375,7 +377,7 @@ func (b *BlockUserAgents) logMetricsSnapshot() {
 // clientIP returns the client IP for logging. When ClientIPHeader is
 // configured, the first comma-separated value of that header is used; the
 // content is trusted verbatim. Otherwise req.RemoteAddr is returned.
-func (b *BlockUserAgents) clientIP(req *http.Request) string {
+func (b *UserAgentPolicy) clientIP(req *http.Request) string {
 	if b.clientIPHeader == "" {
 		return req.RemoteAddr
 	}
@@ -392,8 +394,8 @@ func (b *BlockUserAgents) clientIP(req *http.Request) string {
 // logBlockedRequest logs details of a blocked request. In log-only mode the
 // "Blocked" prefix becomes "Would-Block" so the log clearly distinguishes a
 // staged rule from an enforced one.
-func (b *BlockUserAgents) logBlockedRequest(req *http.Request, reason string) {
-	message := &BlockUserAgentsMessage{
+func (b *UserAgentPolicy) logBlockedRequest(req *http.Request, reason string) {
+	message := &BlockedRequestLog{
 		UserAgent:  req.UserAgent(),
 		RemoteAddr: b.clientIP(req),
 		Host:       req.Host,
