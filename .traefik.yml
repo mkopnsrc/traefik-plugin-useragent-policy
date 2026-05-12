@@ -12,9 +12,9 @@ testData:
     - name: "Firefox"
       regex: "Firefox/13[1-5].*" # Firefox 131-135
     - name: "Edg" # Microsoft Edge
-      regex: "Edg/10[0-9]" # Edge 100-199
-    - name: "Brave" 
-      regex: "Brave/1.[7][5-9]" # Brave 1.75-1.99
+      regex: "Edg/10[0-9]" # Edge 100-109
+    - name: "Brave"
+      regex: "Brave/1\\.[7][5-9]" # Brave 1.75-1.79 (escape the literal dot)
     - name: "CriOS" # Chrome for iOS
       regex: "CriOS/13[0-9]"
   allowedOSTypes:
