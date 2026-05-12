@@ -21,7 +21,11 @@ A Traefik middleware plugin that gates HTTP requests by `User-Agent` — deny by
 
 The repository was renamed from `traefik-plugin-block-useragents` to `traefik-plugin-useragent-policy` in **v0.8.0-alpha**. The change is module-path-only — no config field renames, no behavior changes, no API breakage in `CreateConfig` / `New`.
 
-**What you need to do:** update `moduleName` in your Traefik config:
+**Two paths to update depending on how you load the plugin.** Pick the one matching your Traefik static config.
+
+### If you use `experimental.plugins:` (Traefik catalog / registry)
+
+Update both the local plugin key, the `moduleName`, and the `version`:
 
 ```diff
  experimental:
@@ -34,7 +38,26 @@ The repository was renamed from `traefik-plugin-block-useragents` to `traefik-pl
 +      version: "v0.8.0-alpha"
 ```
 
-And update any middleware references from `block_useragents:` to `useragent_policy:` (or whatever local key you choose) in the `http.middlewares` block.
+`version:` is **required** under `experimental.plugins:` — Traefik fetches the named tag from the module URL.
+
+### If you use `experimental.localPlugins:` (mounted source directory)
+
+Update the local plugin key and the `moduleName`. Do **not** add a `version:` line — `experimental.localPlugins` does not accept it (Traefik will fail to start with `field not found, node: version`).
+
+```diff
+ experimental:
+   localPlugins:
+-    block_useragents:
+-      moduleName: "github.com/mkopnsrc/traefik-plugin-block-useragents"
++    useragent_policy:
++      moduleName: "github.com/mkopnsrc/traefik-plugin-useragent-policy"
+```
+
+The version of the plugin in this mode is whatever is in the mounted directory; pin it via your deployment, not via Traefik config.
+
+### Common to both
+
+Update any middleware references from `block_useragents:` to `useragent_policy:` (or whatever local key you choose) in the `http.middlewares.*.plugin.<key>` block — the key must be the same one you used under `experimental.{plugins,localPlugins}`.
 
 GitHub redirects requests for the old repo URL to the new one, so existing pinned-to-v0.7.x configs continue to resolve. New deployments should use the new path. Tags from v0.7.x and earlier remain published under the new repo.
 
@@ -101,12 +124,13 @@ Counters in a snapshot are read independently, so `total` may briefly differ fro
 3. Attach the plugin to your Traefik middleware.
 
 ## Traefik Experimental Plugin Registry (traefik.yml)
+Required under `experimental.plugins`: both `moduleName` and `version`. Pick a published tag from this repo's [releases page](https://github.com/mkopnsrc/traefik-plugin-useragent-policy/releases).
 ```yaml
 experimental:
   plugins:
     useragent_policy:
       moduleName: "github.com/mkopnsrc/traefik-plugin-useragent-policy"
-      version: "v1.0" # Optional
+      version: "v0.8.0-alpha"
 ```
 
 ## Traefik Local Plugin (traefik.yml)
@@ -235,3 +259,30 @@ http:
       middlewares:
         - block-ua
 ```
+
+## Publishing to the Traefik Plugins Catalog
+
+This plugin is structured for inclusion in the [Traefik Plugins Catalog](https://plugins.traefik.io). Discovery is automatic: Traefik's catalog scans GitHub for public repositories that have the `traefik-plugin` topic and a valid `.traefik.yml` manifest at the repository root.
+
+**Catalog requirements (current state):**
+
+| Requirement | Status |
+| --- | --- |
+| Public GitHub repository | ✅ |
+| `LICENSE` at repo root (Apache-2.0) | ✅ |
+| `.traefik.yml` manifest with `displayName`, `type`, `import`, `summary`, `description`, `testData` | ✅ |
+| `import:` matches the Go module path declared in `go.mod` | ✅ |
+| At least one published version tag | ✅ (latest: see [releases](https://github.com/mkopnsrc/traefik-plugin-useragent-policy/releases)) |
+| `traefik-plugin` topic on the GitHub repo (catalog discovery) | Set via `gh repo edit --add-topic traefik-plugin` |
+| Plugin loads cleanly under Yaegi (stdlib-only imports) | ✅ — no third-party dependencies |
+| `testData` in `.traefik.yml` is a valid working config | ✅ |
+
+The catalog runs the plugin against the manifest's `testData` block to validate it loads. Keep `testData` minimal-and-correct — it is a sanity check, not a feature showcase.
+
+**To submit / re-list after a release:**
+
+1. Push the new tag (e.g. `v0.8.0-alpha`) and publish a GitHub Release.
+2. Catalog typically re-indexes within a few hours of a tag push on a topic-flagged repo. No manual submission step is required for an already-listed plugin.
+3. For first-time inclusion, after adding the `traefik-plugin` topic you may also need to file a tracking issue at the [Traefik plugins repository](https://github.com/traefik/plugins) — see their current onboarding instructions.
+
+For a non-catalog deployment (private fork, on-prem, development), use `experimental.localPlugins:` and skip the catalog entirely — see the **Migration** section above for the difference.
